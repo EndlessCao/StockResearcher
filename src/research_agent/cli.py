@@ -10,12 +10,15 @@ import uvicorn
 from rich.console import Console
 from rich.table import Table
 
+from .config import settings
 from .models import ReportRequest
+from .observability import configure_logging
 from .orchestrator import ResearchOrchestrator
 
 
 app = typer.Typer(help="本地优先的金融深度研究 Agent", no_args_is_help=True)
 console = Console()
+configure_logging(settings.log_level)
 
 
 @app.command()
@@ -50,6 +53,10 @@ def report(
     console.print(f"[green]研报已生成[/green]  ID: {result.id}")
     console.print(f"文件: {destination}")
     console.print(f"引用来源: {len(result.citations)}")
+    if result.qa_warnings:
+        console.print(f"[yellow]QA 告警: {len(result.qa_warnings)} 条[/yellow]")
+        for warning in result.qa_warnings:
+            console.print(f"  - {warning}")
 
 
 @app.command()

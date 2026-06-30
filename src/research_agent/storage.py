@@ -44,7 +44,7 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS reports (
                     id TEXT PRIMARY KEY, task_id TEXT NOT NULL, title TEXT NOT NULL,
                     content TEXT NOT NULL, path TEXT NOT NULL, citations TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    qa_warnings TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS conversations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, report_id TEXT NOT NULL,
@@ -55,6 +55,9 @@ class Storage:
                 CREATE INDEX IF NOT EXISTS idx_sources_task ON sources(task_id);
                 """
             )
+            columns = {row[1] for row in db.execute("PRAGMA table_info(reports)")}
+            if "qa_warnings" not in columns:
+                db.execute("ALTER TABLE reports ADD COLUMN qa_warnings TEXT NOT NULL DEFAULT '[]'")
 
     def create_task(self, task_id: str, topic: str) -> TaskRecord:
         record = TaskRecord(id=task_id, topic=topic, status="pending", created_at=utc_now())
@@ -108,11 +111,12 @@ class Storage:
     def save_report(self, report: ReportRecord) -> None:
         with self.connect() as db:
             db.execute(
-                """INSERT INTO reports(id, task_id, title, content, path, citations, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO reports(id, task_id, title, content, path, citations, qa_warnings, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     report.id, report.task_id, report.title, report.content, report.path,
-                    json.dumps(report.citations, ensure_ascii=False), report.created_at,
+                    json.dumps(report.citations, ensure_ascii=False),
+                    json.dumps(report.qa_warnings, ensure_ascii=False), report.created_at,
                 ),
             )
             db.executemany(
@@ -133,6 +137,7 @@ class Storage:
             return None
         data = dict(row)
         data["citations"] = json.loads(data["citations"])
+        data["qa_warnings"] = json.loads(data.get("qa_warnings") or "[]")
         return ReportRecord(**data)
 
     def list_reports(self, limit: int = 50) -> list[ReportRecord]:
@@ -144,6 +149,7 @@ class Storage:
         for row in rows:
             data = dict(row)
             data["citations"] = json.loads(data["citations"])
+            data["qa_warnings"] = json.loads(data.get("qa_warnings") or "[]")
             reports.append(ReportRecord(**data))
         return reports
 
@@ -186,4 +192,3 @@ class Storage:
                 (report_id, limit),
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
-

@@ -19,19 +19,9 @@ class SourceDocument(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class ResearchSubQuestion(BaseModel):
-    question: str
-    search_keywords: list[str] = Field(default_factory=list)
-    counter_keywords: list[str] = Field(default_factory=list)
-    data_targets: list[str] = Field(default_factory=list)
-    priority: Literal["high", "medium", "low"] = "medium"
-
-
 class ReportChapter(BaseModel):
     title: str
-    description: str
-    sections: list[str] = Field(default_factory=list)
-    sub_questions: list[ResearchSubQuestion] = Field(default_factory=list)
+    focus: str
 
 
 class ResearchPlan(BaseModel):
@@ -74,6 +64,7 @@ class ReportRecord(BaseModel):
     content: str
     path: str
     citations: list[dict[str, Any]]
+    qa_warnings: list[str] = Field(default_factory=list)
     created_at: str
 
 

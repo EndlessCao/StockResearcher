@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import logging
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -13,12 +16,14 @@ from .models import (
     ReportRecord,
     ReportRequest,
     ResearchPlan,
-    ResearchSubQuestion,
     SourceDocument,
     utc_now,
 )
 from .report_writer import MODE_LIMITS, ProfessionalReportWriter
 from .storage import Storage
+
+
+logger = logging.getLogger(__name__)
 
 
 class ResearchOrchestrator:
@@ -30,86 +35,103 @@ class ResearchOrchestrator:
         self.search = SearchConnector(self.config)
 
     def plan(self, topic: str, mode: str = "standard") -> ResearchPlan:
+        logger.info("研报规划开始 topic=%r mode=%s", topic, mode)
         fallback = self._fallback_plan(topic, mode)
         if not self.llm.available:
+            logger.info("研报规划使用本地兜底大纲 reason=llm_not_configured chapters=%d", len(fallback.chapters))
             return fallback
         try:
-            result = self.llm.json(
-                """你是严谨的证券研究规划员。只设计研究结构，不陈述未经检索的事实。只输出合法 JSON。""",
-                f"""为“{topic}”设计 {mode} 模式中文专业研报大纲，目标年份为 {datetime.now().year}。
-章节数量必须为 {MODE_LIMITS[mode]['chapters']}，标题必须包含判断而不是“行业概况”式空标题。
-第一章给核心判断，最后两章覆盖风险/反方观点与投资判断边界。每章 2-4 个子节。
-每章至少一个可独立搜索的子问题，涉及市场、财务、份额、估值时列出具体 data_targets。
-至少一个子问题带 counter_keywords。不得编造任何数据。
-
-返回：
-{{"title":"标题","report_type":"公司/产品研究","target_year":{datetime.now().year},"time_anchor":"latest","chapters":[
-{{"title":"判断式标题","description":"本章要验证的判断","sections":["子节标题"],"sub_questions":[
-{{"question":"问题","search_keywords":["关键词"],"counter_keywords":[],"data_targets":["指标"],"priority":"high"}}
-]}}
-]}}""",
+            raw = self.llm.complete(
+                "你是证券研究规划员。只返回 JSON，不写解释，不陈述未经检索的事实。",
+                f"""为“{topic}”设计中文研报大纲。建议生成 {MODE_LIMITS[mode]['chapters']} 章。
+必须严格返回以下结构，字段只能是 title、chapters、chapters[].title、chapters[].focus：
+{{
+  "title": "报告标题",
+  "chapters": [
+    {{"title": "章节标题", "focus": "写作重点"}}
+  ]
+}}
+章节应覆盖核心判断、研究边界、行业与市场、商业与财务、竞争、风险与反方观点、最终判断。""",
+                temperature=0,
+                max_tokens=2500,
             )
-            chapters = [ReportChapter.model_validate(item) for item in result.get("chapters", [])]
-            if len(chapters) != MODE_LIMITS[mode]["chapters"]:
-                return fallback
-            questions = [
-                question.question
-                for chapter in chapters
-                for question in chapter.sub_questions
-                if question.question.strip()
-            ]
-            return ResearchPlan(
+            result = self._parse_outline_json(raw)
+            chapters = self._normalize_outline_chapters(topic, mode, result["chapters"])
+            questions = [f"{topic} {chapter.title} {chapter.focus} 最新数据与反方证据" for chapter in chapters]
+            plan = ResearchPlan(
                 topic=topic,
                 title=str(result.get("title") or f"{topic}深度研究报告"),
-                report_type=str(result.get("report_type") or "公司/产品研究"),
                 depth_mode=mode,
                 target_year=int(result.get("target_year") or datetime.now().year),
-                time_anchor=result.get("time_anchor", "latest"),
-                questions=questions or fallback.questions,
+                questions=questions,
                 chapters=chapters,
             )
-        except Exception:
+            logger.info(
+                "研报规划完成 title=%r chapters=%d questions=%d",
+                plan.title,
+                len(plan.chapters),
+                len(plan.questions),
+            )
+            return plan
+        except Exception as exc:
+            logger.warning("研报规划失败，使用本地兜底大纲 error=%s", type(exc).__name__)
             return fallback
 
     @staticmethod
-    def _fallback_plan(topic: str, mode: str) -> ResearchPlan:
+    def _parse_outline_json(raw: str) -> dict:
+        cleaned = raw.strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        payload = json.loads(cleaned)
+        if not isinstance(payload, dict) or not isinstance(payload.get("title"), str):
+            raise ValueError("大纲缺少有效 title")
+        if set(payload) != {"title", "chapters"}:
+            raise ValueError("大纲只能包含 title 和 chapters")
+        if not isinstance(payload.get("chapters"), list):
+            raise ValueError("大纲缺少有效 chapters")
+        for chapter in payload["chapters"]:
+            if not isinstance(chapter, dict) or not isinstance(chapter.get("title"), str) or not isinstance(chapter.get("focus"), str):
+                raise ValueError("章节必须包含字符串 title 和 focus")
+            if set(chapter) != {"title", "focus"}:
+                raise ValueError("章节只能包含 title 和 focus")
+        return payload
+
+    @staticmethod
+    def _fixed_chapters(topic: str, mode: str) -> list[ReportChapter]:
         templates = [
-            ("核心判断：增长质量取决于需求、供给与兑现能力", ["核心结论", "关键变量", "争议焦点"]),
-            ("研究边界：先统一对象、口径与可比范围", ["对象定义", "业务边界", "数据口径"]),
-            ("行业空间：结构性需求决定增长上限", ["需求驱动", "市场空间", "周期位置"]),
-            ("商业模式：收入增长需要利润与现金流验证", ["收入结构", "盈利机制", "现金流质量"]),
-            ("竞争格局：领先优势取决于可持续壁垒", ["主要对手", "竞争壁垒", "份额变化"]),
-            ("经营兑现：战略价值最终回到财务结果", ["增长表现", "利润表现", "经营效率"]),
-            ("估值框架：预期差比静态倍数更关键", ["估值口径", "关键假设", "敏感性"]),
-            ("风险与反方：核心逻辑存在可证伪条件", ["下行风险", "反方证据", "证伪指标"]),
-            ("催化与跟踪：边际变化决定观点调整", ["潜在催化", "跟踪指标", "情景变化"]),
-            ("投资判断：结论必须服从证据边界", ["基准情景", "乐观与悲观情景", "判断边界"]),
+            ("核心判断", "提炼最重要的结论、关键变量及其证据边界。"),
+            ("研究对象与口径", "定义研究对象、业务边界、时间范围和指标口径。"),
+            ("行业与市场空间", "分析需求驱动、市场规模、增速和周期位置。"),
+            ("商业模式与经营质量", "分析收入结构、盈利机制、现金流和经营效率。"),
+            ("竞争格局与壁垒", "比较主要对手、市场份额、竞争优势及其可持续性。"),
+            ("财务表现与关键指标", "核查增长、利润、现金流和资产负债表表现。"),
+            ("估值与情景假设", "区分实际数据、机构预期和不同情景下的估值假设。"),
+            ("风险与反方观点", "呈现反方证据、下行风险和核心逻辑的证伪条件。"),
+            ("催化因素与跟踪指标", "识别可能改变判断的事件和持续跟踪指标。"),
+            ("结论与判断边界", "形成结论，同时明确不确定性和不构成投资承诺的边界。"),
         ]
-        chapter_count = MODE_LIMITS[mode]["chapters"]
         if mode == "quick":
-            selected = [templates[i] for i in (0, 1, 2, 4, 7, 9)]
+            templates = [templates[index] for index in (0, 1, 2, 4, 7, 9)]
         elif mode == "standard":
-            selected = [templates[i] for i in (0, 1, 2, 3, 4, 5, 7, 9)]
-        else:
-            selected = templates
-        chapters = []
-        for title, sections in selected[:chapter_count]:
-            is_counter = "风险" in title or "反方" in title
-            question = ResearchSubQuestion(
-                question=f"{topic} {title}需要哪些最新事实与量化指标验证？",
-                search_keywords=[f"{topic} {section} {datetime.now().year}" for section in sections[:2]],
-                counter_keywords=[f"{topic} 风险 反方观点"] if is_counter else [],
-                data_targets=sections,
-                priority="high" if is_counter or "核心" in title else "medium",
-            )
-            chapters.append(
-                ReportChapter(
-                    title=title,
-                    description=f"围绕“{title}”检验证据、因果机制与判断边界。",
-                    sections=sections,
-                    sub_questions=[question],
-                )
-            )
+            templates = [templates[index] for index in (0, 1, 2, 3, 4, 5, 7, 9)]
+        return [ReportChapter(title=title, focus=f"围绕{topic}，{focus}") for title, focus in templates]
+
+    @classmethod
+    def _normalize_outline_chapters(cls, topic: str, mode: str, raw_chapters: list[dict]) -> list[ReportChapter]:
+        target = MODE_LIMITS[mode]["chapters"]
+        chapters = [ReportChapter(title=item["title"].strip(), focus=item["focus"].strip()) for item in raw_chapters]
+        existing = {chapter.title for chapter in chapters}
+        for chapter in cls._fixed_chapters(topic, mode):
+            if len(chapters) >= target:
+                break
+            if chapter.title not in existing:
+                chapters.append(chapter)
+                existing.add(chapter.title)
+        return chapters[:target]
+
+    @classmethod
+    def _fallback_plan(cls, topic: str, mode: str) -> ResearchPlan:
+        chapters = cls._normalize_outline_chapters(topic, mode, [])
         return ResearchPlan(
             topic=topic,
             title=f"{topic}深度研究报告",
@@ -117,31 +139,59 @@ class ResearchOrchestrator:
             depth_mode=mode,
             target_year=datetime.now().year,
             time_anchor="latest",
-            questions=[item.question for chapter in chapters for item in chapter.sub_questions],
+            questions=[f"{topic} {chapter.title} {chapter.focus} 最新数据与反方证据" for chapter in chapters],
             chapters=chapters,
         )
 
     def create_report(self, request: ReportRequest) -> ReportRecord:
         task_id = f"task_{uuid.uuid4().hex[:12]}"
+        logger.info(
+            "研报任务开始 task_id=%s topic=%r mode=%s web_search=%s local_sources=%d max_search_results=%d",
+            task_id,
+            request.topic,
+            request.mode,
+            request.web_search,
+            len(request.sources),
+            request.max_search_results,
+        )
         self.storage.create_task(task_id, request.topic)
         self.storage.update_task(task_id, status="running")
         try:
             plan = self.plan(request.topic, request.mode)
+            logger.info("资料收集开始 task_id=%s", task_id)
             sources = self._collect_sources(request, plan)
             if not sources:
                 raise RuntimeError("没有可用资料：请配置搜索 API，或通过 --sources 提供本地文件/URL")
+            logger.info("资料收集完成 task_id=%s sources=%d", task_id, len(sources))
             for source in sources:
                 self.storage.add_source(task_id, source)
+            logger.info("资料切分与入库完成 task_id=%s sources=%d", task_id, len(sources))
+            logger.info("研报写作开始 task_id=%s chapters=%d", task_id, len(plan.chapters))
             report = self._write_report(task_id, request.topic, plan, sources)
+            logger.info(
+                "研报写作完成 task_id=%s report_id=%s content_chars=%d",
+                task_id,
+                report.id,
+                len(report.content),
+            )
             self.storage.save_report(report)
+            logger.info("研报及上下文入库完成 task_id=%s report_id=%s", task_id, report.id)
             self.storage.update_task(
                 task_id, status="completed", report_id=report.id, completed_at=utc_now()
+            )
+            logger.info(
+                "研报任务完成 task_id=%s report_id=%s path=%s citations=%d",
+                task_id,
+                report.id,
+                report.path,
+                len(report.citations),
             )
             return report
         except Exception as exc:
             self.storage.update_task(
                 task_id, status="failed", error=str(exc), completed_at=utc_now()
             )
+            logger.exception("研报任务失败 task_id=%s error=%s", task_id, type(exc).__name__)
             raise
 
     def _collect_sources(self, request: ReportRequest, plan: ResearchPlan) -> list[SourceDocument]:
@@ -149,14 +199,23 @@ class ResearchOrchestrator:
         for location in request.sources:
             sources.extend(self.documents.load(location))
         if request.web_search:
+            logger.info(
+                "网络检索开始 provider=%s questions=%d", self.search.provider, len(plan.questions)
+            )
             search_docs = self.search.search(plan.questions, request.max_search_results)
+            logger.info("网络检索结果获取完成 results=%d，开始抓取正文", len(search_docs))
             # Grab full text for a few results. A blocked page falls back to its search snippet.
             for item in search_docs[:4]:
                 try:
                     loaded = self.documents.load(item.url)[0]
                     loaded.metadata.update(item.metadata)
                     sources.append(loaded)
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "网页正文抓取失败，保留搜索摘要 source_id=%s error=%s",
+                        item.id,
+                        type(exc).__name__,
+                    )
                     sources.append(item)
             sources.extend(search_docs[4:])
         deduped: dict[str, SourceDocument] = {}
@@ -164,12 +223,21 @@ class ResearchOrchestrator:
             key = source.url or source.id
             if source.content.strip() and key not in deduped:
                 deduped[key] = source
-        return list(deduped.values())
+        result = list(deduped.values())
+        logger.info("资料去重完成 before=%d after=%d", len(sources), len(result))
+        return result
 
     def _write_report(
         self, task_id: str, topic: str, plan: ResearchPlan, sources: list[SourceDocument]
     ) -> ReportRecord:
         report_id = f"report_{uuid.uuid4().hex[:12]}"
+        logger.info(
+            "专业研报写作器启动 report_id=%s mode=%s chapters=%d sources=%d",
+            report_id,
+            plan.depth_mode,
+            len(plan.chapters),
+            len(sources),
+        )
         citations = [
             {
                 "id": f"S{index}",
@@ -180,11 +248,12 @@ class ResearchOrchestrator:
             }
             for index, source in enumerate(sources, 1)
         ]
-        content = ProfessionalReportWriter(self.config, self.llm).write(
+        content, qa_warnings = ProfessionalReportWriter(self.config, self.llm).write(
             topic, plan, sources, citations
         )
         path = self.config.reports_dir / f"{report_id}.md"
         path.write_text(content, encoding="utf-8")
+        logger.info("Markdown 研报文件写入完成 report_id=%s path=%s", report_id, path.resolve())
         return ReportRecord(
             id=report_id,
             task_id=task_id,
@@ -192,6 +261,7 @@ class ResearchOrchestrator:
             content=content,
             path=str(path.resolve()),
             citations=citations,
+            qa_warnings=qa_warnings,
             created_at=utc_now(),
         )
 

@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     chunk_size: int = 1_200
     chunk_overlap: int = 160
     report_writer_workers: int = 3
+    log_level: str = "INFO"
 
     @property
     def model_name(self) -> str:

@@ -62,11 +62,13 @@ curl -X POST http://127.0.0.1:8000/api/v1/reports \
 
 写作部分参考 `tmp/deep-research` 的质量规范，但继续使用本项目既有的本地文件、URL、Tavily、Brave 和 SerpAPI 信息源：
 
-1. 按 `quick / standard / deep` 生成 6 / 8 / 10 章判断式大纲，并锚定目标年份。
+1. 大纲模型只返回 `title` 和 `chapters[].title/focus`。程序去除 JSON 围栏后使用 `json.loads()` 校验，再按 `quick / standard / deep` 补齐或裁剪为 6 / 8 / 10 章；无效 JSON 完全回退到固定大纲。
 2. 按章节从现有资料中检索相关片段，建立带固定 `[S1]` 引用编号的证据包。
-3. 并行撰写章节；每章执行“结论 → 证据 → 因果 → 判断边界”，并要求反方观点和预测措辞。
-4. 单章超时只降级该章为证据摘要，不影响其他章节和最终报告交付。
-5. 统一装配标题、元数据、目录、可信评估、参考来源和免责声明，并校验章节及引用完整性。
+3. 并行撰写章节；每章执行“核心判断 → 事实 → 因果 → 判断”，要求区分实际数据、机构预期和情景假设，并包含反方观点。
+4. 某章完全没有 `[Sx]` 时追加严格约束并重写一次；第二次仍无引用只记录 QA 告警，不继续重写。
+5. 标题、元数据、研究问题、目录、编号章节、参考来源与证据、免责声明全部由代码装配。非法 `[S99]` 只记录 QA 告警并保留原文。
+
+QA 告警保存在研报记录的 `qa_warnings` 字段中。QA 不通过不会阻止报告保存，任务仍返回成功。
 
 默认 `standard` 模式。`quick` 适合快速验证，`deep` 会产生更多章节和模型调用。
 
@@ -78,9 +80,12 @@ curl -X POST http://127.0.0.1:8000/api/v1/reports \
 - 搜索：`TAVILY_API_KEYS`、`BRAVE_API_KEYS`、`SERPAPI_API_KEYS`，按 Tavily → Brave → SerpAPI 自动选择
 - 行情扩展：`ALPACA_API_KEY`、`ALPACA_SECRET_KEY`、`ALPACA_DATA_BASE_URL`、`ALPACA_DATA_FEED`
 - 情绪扩展预留：`SOCIAL_SENTIMENT_API_KEY`、`SOCIAL_SENTIMENT_API_URL`
+- 日志级别：`LOG_LEVEL`，默认 `INFO`
 
 多个搜索 Key 可用英文逗号分隔，原型默认使用第一个。模型未配置时仍可运行，会输出证据摘要版研报与检索片段，不会伪造分析。
 `LITELLM_MODEL` 若使用 `openai/model-name` 或 `deepseek/model-name` 形式，程序会在直连 OpenAI 兼容端点时自动移除提供商前缀。
+
+CLI 和 FastAPI 默认输出研报生成流程日志，包括任务规划、搜索 API、网页抓取、LLM 调用、章节并行写作、报告校验与文件入库。日志只记录模型名、耗时、字符数、Token 用量和 HTTP 状态等元信息，不输出 API Key 或完整提示词。
 
 ## 当前边界
 

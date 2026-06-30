@@ -25,8 +25,9 @@ def test_local_report_and_chat_without_external_services(tmp_path: Path) -> None
     assert "某公司2025年营收增长20%" in report.content
     assert report.citations[0]["id"] == "S1"
     assert "## 目录" in report.content
-    assert "## 可信评估" in report.content
-    assert "## 参考来源" in report.content
+    assert "> **研究问题**：某公司增长分析" in report.content
+    assert "## 1. 核心判断" in report.content
+    assert "## 参考来源与证据" in report.content
     assert "## 免责声明" in report.content
     plan = agent._fallback_plan("某公司增长分析", "standard")
     assert ProfessionalReportWriter.validate(report.content, plan, report.citations) == []
@@ -72,8 +73,9 @@ def test_report_degrades_when_llm_fails(tmp_path: Path) -> None:
     report = agent.create_report(
         ReportRequest(topic="降级测试", sources=[str(source)], web_search=False)
     )
-    assert "已自动降级为证据摘要版" in report.content
+    assert any("已降级" in warning for warning in report.qa_warnings)
     assert agent.storage.get_task(report.task_id).status == "completed"
+    assert agent.storage.get_report(report.id).qa_warnings == report.qa_warnings
 
 
 def test_report_modes_have_expected_chapter_counts(tmp_path: Path) -> None:
@@ -85,11 +87,70 @@ def test_report_modes_have_expected_chapter_counts(tmp_path: Path) -> None:
     assert len(agent.plan("测试主题", "deep").chapters) == 10
 
 
-def test_incomplete_model_chapter_is_rejected(tmp_path: Path) -> None:
+def test_outline_json_fences_and_chapter_fill(tmp_path: Path) -> None:
     agent = ResearchOrchestrator(
         Settings(_env_file=None, openai_api_key="", data_dir=tmp_path / "data")
     )
-    chapter = agent._fallback_plan("测试主题", "quick").chapters[0]
-    assert not ProfessionalReportWriter._chapter_is_valid(
-        1, chapter, "> 只有结论，没有预定子节和引用。"
+    payload = agent._parse_outline_json(
+        '```json\n{"title":"测试报告","chapters":[{"title":"自定义章","focus":"验证重点"}]}\n```'
     )
+    chapters = agent._normalize_outline_chapters("测试主题", "quick", payload["chapters"])
+    assert payload["title"] == "测试报告"
+    assert len(chapters) == 6
+    assert chapters[0].focus == "验证重点"
+    oversized = [{"title": f"章{i}", "focus": "重点"} for i in range(20)]
+    assert len(agent._normalize_outline_chapters("测试主题", "quick", oversized)) == 6
+
+
+def test_invalid_outline_falls_back_completely(tmp_path: Path) -> None:
+    agent = ResearchOrchestrator(
+        Settings(_env_file=None, openai_api_key="", data_dir=tmp_path / "data")
+    )
+
+    class InvalidOutlineLLM:
+        available = True
+
+        def complete(self, *_args, **_kwargs):
+            return "这不是 JSON"
+
+    agent.llm = InvalidOutlineLLM()
+    plan = agent.plan("测试主题", "quick")
+    assert plan.title == "测试主题深度研究报告"
+    assert [chapter.title for chapter in plan.chapters][-2:] == ["风险与反方观点", "结论与判断边界"]
+
+
+def test_missing_citation_rewrites_only_once(tmp_path: Path) -> None:
+    agent = ResearchOrchestrator(
+        Settings(_env_file=None, openai_api_key="", data_dir=tmp_path / "data")
+    )
+    plan = agent._fallback_plan("测试主题", "quick")
+
+    class RewriteLLM:
+        available = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, *_args, **_kwargs):
+            self.calls += 1
+            return "> 判断\n\n第二次包含事实引用[S1]。" if self.calls == 2 else "> 判断\n\n没有引用。"
+
+    llm = RewriteLLM()
+    writer = ProfessionalReportWriter(agent.config, llm)
+    content, rewritten = writer._write_one_chapter(1, 6, plan.chapters[0], "[S1] 证据", plan)
+    assert rewritten is True
+    assert llm.calls == 2
+    assert "[S1]" in content
+
+
+def test_invalid_citation_is_warning_not_replaced(tmp_path: Path) -> None:
+    agent = ResearchOrchestrator(
+        Settings(_env_file=None, openai_api_key="", data_dir=tmp_path / "data")
+    )
+    plan = agent._fallback_plan("测试主题", "quick")
+    report = ProfessionalReportWriter._assemble(
+        "测试主题", plan, ["> 判断[S99]" for _ in plan.chapters], [{"id": "S1", "title": "证据", "url": ""}]
+    )
+    warnings = ProfessionalReportWriter.validate(report, plan, [{"id": "S1"}])
+    assert "[S99]" in report
+    assert "引用不存在：[S99]" in warnings

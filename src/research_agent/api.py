@@ -3,9 +3,13 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 
 from . import __version__
+from .config import settings
 from .models import ChatRequest, ChatResponse, ReportRecord, ReportRequest, TaskRecord
+from .observability import configure_logging
 from .orchestrator import ResearchOrchestrator
 
+
+configure_logging(settings.log_level)
 
 app = FastAPI(
     title="Stock Research Agent API",
@@ -62,4 +66,3 @@ def get_task(task_id: str) -> TaskRecord:
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
     return task
-
