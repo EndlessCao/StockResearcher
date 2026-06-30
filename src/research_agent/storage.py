@@ -44,7 +44,9 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS reports (
                     id TEXT PRIMARY KEY, task_id TEXT NOT NULL, title TEXT NOT NULL,
                     content TEXT NOT NULL, path TEXT NOT NULL, citations TEXT NOT NULL,
-                    qa_warnings TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL
+                    qa_warnings TEXT NOT NULL DEFAULT '[]', stock_code TEXT,
+                    data_cutoff TEXT, source_types TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL, is_pinned INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS conversations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, report_id TEXT NOT NULL,
@@ -58,6 +60,14 @@ class Storage:
             columns = {row[1] for row in db.execute("PRAGMA table_info(reports)")}
             if "qa_warnings" not in columns:
                 db.execute("ALTER TABLE reports ADD COLUMN qa_warnings TEXT NOT NULL DEFAULT '[]'")
+            if "stock_code" not in columns:
+                db.execute("ALTER TABLE reports ADD COLUMN stock_code TEXT")
+            if "data_cutoff" not in columns:
+                db.execute("ALTER TABLE reports ADD COLUMN data_cutoff TEXT")
+            if "source_types" not in columns:
+                db.execute("ALTER TABLE reports ADD COLUMN source_types TEXT NOT NULL DEFAULT '[]'")
+            if "is_pinned" not in columns:
+                db.execute("ALTER TABLE reports ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0")
 
     def create_task(self, task_id: str, topic: str) -> TaskRecord:
         record = TaskRecord(id=task_id, topic=topic, status="pending", created_at=utc_now())
@@ -111,12 +121,16 @@ class Storage:
     def save_report(self, report: ReportRecord) -> None:
         with self.connect() as db:
             db.execute(
-                """INSERT INTO reports(id, task_id, title, content, path, citations, qa_warnings, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO reports(
+                id, task_id, title, content, path, citations, qa_warnings,
+                stock_code, data_cutoff, source_types, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     report.id, report.task_id, report.title, report.content, report.path,
                     json.dumps(report.citations, ensure_ascii=False),
-                    json.dumps(report.qa_warnings, ensure_ascii=False), report.created_at,
+                    json.dumps(report.qa_warnings, ensure_ascii=False),
+                    report.stock_code, report.data_cutoff,
+                    json.dumps(report.source_types, ensure_ascii=False), report.created_at,
                 ),
             )
             db.executemany(
@@ -135,23 +149,65 @@ class Storage:
             row = db.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
         if not row:
             return None
-        data = dict(row)
-        data["citations"] = json.loads(data["citations"])
-        data["qa_warnings"] = json.loads(data.get("qa_warnings") or "[]")
-        return ReportRecord(**data)
+        return self._row_to_report(row)
 
     def list_reports(self, limit: int = 50) -> list[ReportRecord]:
         with self.connect() as db:
             rows = db.execute(
-                "SELECT * FROM reports ORDER BY created_at DESC LIMIT ?", (limit,)
+                "SELECT * FROM reports ORDER BY is_pinned DESC, created_at DESC LIMIT ?", (limit,)
             ).fetchall()
-        reports = []
-        for row in rows:
-            data = dict(row)
-            data["citations"] = json.loads(data["citations"])
-            data["qa_warnings"] = json.loads(data.get("qa_warnings") or "[]")
-            reports.append(ReportRecord(**data))
-        return reports
+        return [self._row_to_report(row) for row in rows]
+
+    def update_report(
+        self, report_id: str, *, title: str | None = None, is_pinned: bool | None = None
+    ) -> ReportRecord | None:
+        fields: dict[str, Any] = {}
+        if title is not None:
+            normalized_title = title.strip()
+            if not normalized_title:
+                raise ValueError("研报标题不能为空")
+            fields["title"] = normalized_title
+        if is_pinned is not None:
+            fields["is_pinned"] = int(is_pinned)
+        if not fields:
+            return self.get_report(report_id)
+
+        statement = ", ".join(f"{key} = ?" for key in fields)
+        with self.connect() as db:
+            cursor = db.execute(
+                f"UPDATE reports SET {statement} WHERE id = ?",
+                (*fields.values(), report_id),
+            )
+        return self.get_report(report_id) if cursor.rowcount else None
+
+    def delete_report(self, report_id: str) -> bool:
+        report = self.get_report(report_id)
+        if not report:
+            return False
+        with self.connect() as db:
+            db.execute("DELETE FROM conversations WHERE report_id = ?", (report_id,))
+            db.execute(
+                "DELETE FROM chunks WHERE report_id = ? OR task_id = ?",
+                (report_id, report.task_id),
+            )
+            db.execute("DELETE FROM sources WHERE task_id = ?", (report.task_id,))
+            db.execute("DELETE FROM reports WHERE id = ?", (report_id,))
+            db.execute("DELETE FROM tasks WHERE id = ?", (report.task_id,))
+
+        report_path = Path(report.path).expanduser().resolve()
+        reports_dir = self.config.reports_dir.expanduser().resolve()
+        if report_path.is_relative_to(reports_dir) and report_path.is_file():
+            report_path.unlink()
+        return True
+
+    @staticmethod
+    def _row_to_report(row: sqlite3.Row) -> ReportRecord:
+        data = dict(row)
+        data["citations"] = json.loads(data["citations"])
+        data["qa_warnings"] = json.loads(data.get("qa_warnings") or "[]")
+        data["source_types"] = json.loads(data.get("source_types") or "[]")
+        data["is_pinned"] = bool(data.get("is_pinned", 0))
+        return ReportRecord(**data)
 
     def retrieve(self, report_id: str, query: str, limit: int = 8) -> list[dict[str, Any]]:
         report = self.get_report(report_id)
@@ -184,11 +240,16 @@ class Storage:
                 (report_id, role, content, json.dumps(citations or [], ensure_ascii=False), utc_now()),
             )
 
-    def recent_messages(self, report_id: str, limit: int = 6) -> list[dict[str, str]]:
+    def recent_messages(self, report_id: str, limit: int = 6) -> list[dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute(
-                """SELECT role, content FROM conversations WHERE report_id = ?
+                """SELECT role, content, citations FROM conversations WHERE report_id = ?
                 ORDER BY id DESC LIMIT ?""",
                 (report_id, limit),
             ).fetchall()
-        return [dict(row) for row in reversed(rows)]
+        messages = []
+        for row in reversed(rows):
+            item = dict(row)
+            item["citations"] = json.loads(item.get("citations") or "[]")
+            messages.append(item)
+        return messages

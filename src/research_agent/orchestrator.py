@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import Settings, settings
+from .chat_agent import ReportChatAgent
 from .connectors import DocumentConnector, SearchConnector
 from .llm import LLMClient
 from .models import (
@@ -20,7 +21,9 @@ from .models import (
     utc_now,
 )
 from .report_writer import MODE_LIMITS, ProfessionalReportWriter
+from .retrieval import ChromaHybridRetriever
 from .storage import Storage
+from .text import report_filename
 
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,10 @@ class ResearchOrchestrator:
         self.llm = LLMClient(self.config)
         self.documents = DocumentConnector(self.config)
         self.search = SearchConnector(self.config)
+        self.retriever = ChromaHybridRetriever(self.config)
+        self.chat_agent = ReportChatAgent(
+            self.config, self.llm, self.storage, self.retriever, self.search
+        )
 
     def plan(self, topic: str, mode: str = "standard") -> ResearchPlan:
         logger.info("研报规划开始 topic=%r mode=%s", topic, mode)
@@ -127,7 +134,13 @@ class ResearchOrchestrator:
             if chapter.title not in existing:
                 chapters.append(chapter)
                 existing.add(chapter.title)
-        return chapters[:target]
+        normalized = chapters[:target]
+        return [
+            chapter.model_copy(
+                update={"retrieval_questions": ChromaHybridRetriever.chapter_questions(topic, chapter)}
+            )
+            for chapter in normalized
+        ]
 
     @classmethod
     def _fallback_plan(cls, topic: str, mode: str) -> ResearchPlan:
@@ -167,7 +180,7 @@ class ResearchOrchestrator:
                 self.storage.add_source(task_id, source)
             logger.info("资料切分与入库完成 task_id=%s sources=%d", task_id, len(sources))
             logger.info("研报写作开始 task_id=%s chapters=%d", task_id, len(plan.chapters))
-            report = self._write_report(task_id, request.topic, plan, sources)
+            report = self._write_report(task_id, request.topic, plan, sources, request)
             logger.info(
                 "研报写作完成 task_id=%s report_id=%s content_chars=%d",
                 task_id,
@@ -228,7 +241,12 @@ class ResearchOrchestrator:
         return result
 
     def _write_report(
-        self, task_id: str, topic: str, plan: ResearchPlan, sources: list[SourceDocument]
+        self,
+        task_id: str,
+        topic: str,
+        plan: ResearchPlan,
+        sources: list[SourceDocument],
+        request: ReportRequest,
     ) -> ReportRecord:
         report_id = f"report_{uuid.uuid4().hex[:12]}"
         logger.info(
@@ -248,20 +266,56 @@ class ResearchOrchestrator:
             }
             for index, source in enumerate(sources, 1)
         ]
-        content, qa_warnings = ProfessionalReportWriter(self.config, self.llm).write(
-            topic, plan, sources, citations
+        citation_ids = {source.id: f"S{index}" for index, source in enumerate(sources, 1)}
+        data_cutoff = request.data_cutoff or datetime.now().astimezone().date().isoformat()
+        try:
+            datetime.fromisoformat(data_cutoff)
+        except ValueError as exc:
+            raise ValueError("data_cutoff 必须使用 YYYY-MM-DD 格式") from exc
+        self.retriever.index_documents(task_id, sources, request.stock_code, citation_ids)
+        plan = plan.model_copy(
+            update={
+                "stock_code": request.stock_code,
+                "data_cutoff": data_cutoff,
+                "source_types": request.source_types,
+            }
         )
-        path = self.config.reports_dir / f"{report_id}.md"
+        evidence_packets = []
+        retrieval_diagnostics = []
+        for chapter in plan.chapters:
+            packet, diagnostics = self.retriever.retrieve_chapter(
+                task_id,
+                chapter,
+                request.stock_code,
+                data_cutoff,
+                request.source_types,
+            )
+            evidence_packets.append(packet)
+            retrieval_diagnostics.append(diagnostics)
+            logger.info(
+                "章节混合检索完成 title=%r questions=%d evidence_blocks=%d",
+                chapter.title,
+                len(chapter.retrieval_questions),
+                len(diagnostics),
+            )
+        content, qa_warnings = ProfessionalReportWriter(self.config, self.llm).write(
+            topic, plan, sources, citations, evidence_packets=evidence_packets
+        )
+        report_title = plan.title or f"{topic}研究报告"
+        path = self.config.reports_dir / report_filename(report_title)
         path.write_text(content, encoding="utf-8")
         logger.info("Markdown 研报文件写入完成 report_id=%s path=%s", report_id, path.resolve())
         return ReportRecord(
             id=report_id,
             task_id=task_id,
-            title=plan.title or f"{topic}研究报告",
+            title=report_title,
             content=content,
             path=str(path.resolve()),
             citations=citations,
             qa_warnings=qa_warnings,
+            stock_code=request.stock_code,
+            data_cutoff=data_cutoff,
+            source_types=request.source_types,
             created_at=utc_now(),
         )
 
@@ -269,40 +323,10 @@ class ResearchOrchestrator:
         report = self.storage.get_report(report_id)
         if not report:
             raise KeyError(f"研报不存在：{report_id}")
-        chunks = self.storage.retrieve(report_id, question, limit=8)
-        citations = []
-        context_blocks = []
-        for index, chunk in enumerate(chunks, 1):
-            citation = {
-                "id": f"C{index}",
-                "source_id": chunk.get("source_id"),
-                "title": chunk["source_title"],
-            }
-            citations.append(citation)
-            context_blocks.append(f"[C{index}] {chunk['source_title']}\n{chunk['content']}")
-        history = self.storage.recent_messages(report_id)
-        if self.llm.available:
-            try:
-                answer = self.llm.complete(
-                    """你是研报问答助手。仅依据给定上下文回答，关键结论标注 [C1] 形式引用。
-若资料不足，直接说明。区分研报原文、外部证据与推断。""",
-                    f"研报：{report.title}\n历史对话：{history}\n问题：{question}\n\n"
-                    + "\n\n".join(context_blocks),
-                    temperature=0.1,
-                    max_tokens=1800,
-                )
-            except Exception as exc:
-                answer = f"模型问答失败（{type(exc).__name__}），以下是相关原文片段：\n\n" + "\n\n".join(
-                    f"[C{index}] {chunk['content'][:500]}"
-                    for index, chunk in enumerate(chunks, 1)
-                )
-        else:
-            answer = "未配置模型，以下是与问题最相关的原文片段：\n\n" + "\n\n".join(
-                f"[C{index}] {chunk['content'][:500]}" for index, chunk in enumerate(chunks, 1)
-            )
+        response = self.chat_agent.answer(report, question)
         self.storage.add_message(report_id, "user", question)
-        self.storage.add_message(report_id, "assistant", answer, citations)
-        return ChatResponse(answer=answer, citations=citations)
+        self.storage.add_message(report_id, "assistant", response.answer, response.citations)
+        return response
 
     def import_report(self, path: str) -> ReportRecord:
         file_path = Path(path).expanduser().resolve()

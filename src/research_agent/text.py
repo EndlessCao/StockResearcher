@@ -35,3 +35,9 @@ def query_terms(query: str) -> set[str]:
     bigrams = [word[i : i + 2] for word in chinese for i in range(len(word) - 1)]
     return set(latin + chinese + bigrams)
 
+
+def report_filename(title: str) -> str:
+    """Convert a report title into a portable Markdown filename."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    return f"{(name or '研报')[:180]}.md"

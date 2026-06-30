@@ -6,4 +6,6 @@ __pycache__/
 data/
 reports/
 tmp
-
+macos/.build/
+macos/.swiftpm/
+dist/

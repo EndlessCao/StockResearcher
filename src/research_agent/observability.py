@@ -3,9 +3,9 @@ from __future__ import annotations
 import logging
 
 
-def configure_logging(level: str = "INFO") -> None:
-    """Configure application logs without exposing request bodies or credentials."""
-    numeric_level = getattr(logging, level.upper(), logging.INFO)
+def configure_logging(info_enabled: bool = False) -> None:
+    """Enable application INFO logs only when explicitly requested."""
+    numeric_level = logging.INFO if info_enabled else logging.WARNING
     logging.basicConfig(
         level=numeric_level,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",

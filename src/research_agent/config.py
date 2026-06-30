@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     social_sentiment_api_key: str = ""
     social_sentiment_api_url: str = ""
 
+    embedding_api_key: str = ""
+    embedding_base_url: str = ""
+    embedding_model: str = ""
+    rerank_api_key: str = ""
+    rerank_base_url: str = ""
+    rerank_model: str = ""
+
     data_dir: Path = Field(default=Path("data"))
     request_timeout: float = 25.0
     llm_timeout: float = 180.0
@@ -35,7 +42,19 @@ class Settings(BaseSettings):
     chunk_size: int = 1_200
     chunk_overlap: int = 160
     report_writer_workers: int = 3
-    log_level: str = "INFO"
+    retrieval_candidates: int = 30
+    retrieval_evidence_blocks: int = 10
+    retrieval_max_chunks_per_document: int = 3
+    retrieval_time_half_life_days: int = 365
+    chat_tool_rounds: int = 4
+    chat_history_messages: int = 10
+    chat_report_context_chars: int = 50_000
+    chat_search_results: int = 5
+    info: str = ""
+
+    @property
+    def info_logging_enabled(self) -> bool:
+        return self.info.strip().upper() == "DEBUG"
 
     @property
     def model_name(self) -> str:
@@ -55,6 +74,10 @@ class Settings(BaseSettings):
     def reports_dir(self) -> Path:
         return self.data_dir / "reports"
 
+    @property
+    def chroma_path(self) -> Path:
+        return self.data_dir / "chroma"
+
     @staticmethod
     def first_key(value: str) -> str:
         return next((item.strip() for item in value.split(",") if item.strip()), "")
@@ -62,6 +85,7 @@ class Settings(BaseSettings):
     def ensure_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.reports_dir.mkdir(parents=True, exist_ok=True)
+        self.chroma_path.mkdir(parents=True, exist_ok=True)
 
 
 settings = Settings()

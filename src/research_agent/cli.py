@@ -14,22 +14,28 @@ from .config import settings
 from .models import ReportRequest
 from .observability import configure_logging
 from .orchestrator import ResearchOrchestrator
+from .text import report_filename
 
 
 app = typer.Typer(help="本地优先的金融深度研究 Agent", no_args_is_help=True)
 console = Console()
-configure_logging(settings.log_level)
+configure_logging(settings.info_logging_enabled)
 
 
 @app.command()
 def report(
     topic: str = typer.Option(..., "--topic", "-t", help="研究主题"),
     sources: Optional[list[str]] = typer.Option(None, "--sources", "-s", help="本地文件、目录或 URL，可重复"),
-    output: Optional[Path] = typer.Option(None, "--output", "-o", help="额外复制到指定 Markdown 路径"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="研报输出目录"),
     web: bool = typer.Option(True, "--web/--no-web", help="是否自动网络检索"),
     max_results: int = typer.Option(6, "--max-results", min=0, max=20),
     mode: Literal["quick", "standard", "deep"] = typer.Option(
         "standard", "--mode", help="研报深度：quick / standard / deep"
+    ),
+    stock_code: Optional[str] = typer.Option(None, "--stock-code", help="证券代码元数据过滤"),
+    data_cutoff: Optional[str] = typer.Option(None, "--data-cutoff", help="数据截止日 YYYY-MM-DD"),
+    source_types: Optional[list[str]] = typer.Option(
+        None, "--source-type", help="允许的资料类型，可重复"
     ),
 ) -> None:
     """创建研究任务并生成 Markdown 研报。"""
@@ -42,14 +48,20 @@ def report(
                 web_search=web,
                 max_search_results=max_results,
                 mode=mode,
+                stock_code=stock_code,
+                data_cutoff=data_cutoff,
+                source_types=source_types or [
+                    "annual_report", "quarterly_report", "announcement", "research"
+                ],
             )
         )
     destination = Path(result.path)
     if output:
-        output = output.expanduser().resolve()
-        output.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(destination, output)
-        destination = output
+        output_dir = output.expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        destination = output_dir / report_filename(result.title)
+        if destination.resolve() != Path(result.path).resolve():
+            shutil.copyfile(result.path, destination)
     console.print(f"[green]研报已生成[/green]  ID: {result.id}")
     console.print(f"文件: {destination}")
     console.print(f"引用来源: {len(result.citations)}")

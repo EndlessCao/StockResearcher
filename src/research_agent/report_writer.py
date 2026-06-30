@@ -31,8 +31,11 @@ class ProfessionalReportWriter:
         plan: ResearchPlan,
         sources: list[SourceDocument],
         citations: list[dict[str, Any]],
+        evidence_packets: list[str] | None = None,
     ) -> tuple[str, list[str]]:
-        packets = [self._build_evidence_packet(chapter, sources) for chapter in plan.chapters]
+        packets = evidence_packets or [
+            self._build_evidence_packet(chapter, sources) for chapter in plan.chapters
+        ]
         chapters, warnings = self._write_chapters(plan, packets)
         report = self._assemble(topic, plan, chapters, citations)
         warnings.extend(self.validate(report, plan, citations))
@@ -173,18 +176,24 @@ class ProfessionalReportWriter:
             for index, chapter in enumerate(plan.chapters, 1)
         )
         body = "\n\n".join(
-            f'<a id="chapter-{index}"></a>\n\n## {index}. {chapter.title}\n\n{content}'
+            f'<a id="chapter-{index}"></a>\n\n## {index}. {chapter.title}\n\n'
+            + re.sub(
+                r"(?<!\[)\[(S\d+)\](?!\])",
+                lambda match: f"[[{match.group(1)}]](#ref-{match.group(1).lower()})",
+                content,
+            )
             for index, (chapter, content) in enumerate(zip(plan.chapters, chapters), 1)
         )
         source_lines = "\n".join(
-            f'- [{item["id"]}] [{item["title"]}]({item["url"]})'
+            f'<a id="ref-{item["id"].lower()}"></a>\n\n'
+            + (f'- [{item["id"]}] [{item["title"]}]({item["url"]})'
             if item["url"]
-            else f'- [{item["id"]}] {item["title"]}（本地资料）'
+            else f'- [{item["id"]}] {item["title"]}（本地资料）')
             for item in citations
         )
         return f"""# {title}
 
-> **元数据**：生成时间 {now:%Y-%m-%d %H:%M:%S %z} · 数据截至 {now:%Y-%m} · 调研模式 {plan.depth_mode} · 来源 {len(citations)} 个
+> **元数据**：生成时间 {now:%Y-%m-%d %H:%M:%S %z} · 数据截至 {plan.data_cutoff or now.strftime('%Y-%m-%d')} · 调研模式 {plan.depth_mode} · 证券代码 {plan.stock_code or '未指定'} · 来源 {len(citations)} 个
 >
 > **研究问题**：{topic}
 
