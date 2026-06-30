@@ -1,0 +1,37 @@
+[project]
+name = "stock-research-agent"
+version = "0.1.0"
+description = "Local-first deep research agent for financial research reports"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "beautifulsoup4>=4.12",
+  "fastapi>=0.115",
+  "httpx>=0.27",
+  "openai>=1.55",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  "pypdf>=5.1",
+  "python-multipart>=0.0.17",
+  "rich>=13.9",
+  "typer>=0.13",
+  "uvicorn>=0.32",
+]
+
+[project.scripts]
+research-agent = "research_agent.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/research_agent"]
+
+[dependency-groups]
+dev = ["pytest>=8.3"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
