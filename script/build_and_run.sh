@@ -56,6 +56,7 @@ rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_MACOS" "$APP_RESOURCES/backend"
 cp "$BUILD_BINARY" "$APP_BINARY"
 cp -R "$BACKEND_DIST/." "$APP_RESOURCES/backend/"
+cp "$ROOT_DIR/packaging/AppIcon.icns" "$APP_RESOURCES/AppIcon.icns"
 chmod +x "$APP_BINARY"
 chmod +x "$APP_RESOURCES/backend/research-agent-backend"
 
@@ -72,6 +73,8 @@ cat >"$INFO_PLIST" <<PLIST
   <string>$APP_NAME</string>
   <key>CFBundleDisplayName</key>
   <string>股票研报</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleShortVersionString</key>
   <string>$APP_VERSION</string>
   <key>CFBundleVersion</key>

@@ -1,6 +1,10 @@
 # Stock Research Agent
 
-Stock Research Agent 是一款本地优先的 AI 研报工具，可根据研究问题和参考资料生成结构化 Markdown 研报，并支持围绕研报进行连续问答。
+<p align="center">
+  <img src="assets/icon.png" alt="Stock Research Agent" width="180">
+</p>
+
+Stock Research Agent 是一款本地优先的 AI 研报工具，可根据研究问题和参考资料生成结构化 Markdown 研报，并支持围绕研报进行问答。
 
 项目提供原生 macOS App、命令行工具和 HTTP API。
 
@@ -205,13 +209,6 @@ RERANK_BASE_URL=https://your-rerank-endpoint
 RERANK_MODEL=your_rerank_model
 ```
 
-
-
-## 运行测试
-
-```bash
-uv run pytest
-```
 
 ## 更新日志
 
