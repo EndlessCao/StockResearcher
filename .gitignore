@@ -11,3 +11,4 @@ macos/.swiftpm/
 dist/
 build/
 .DS_Store
+.codex
