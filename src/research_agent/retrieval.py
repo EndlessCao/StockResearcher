@@ -4,6 +4,7 @@ import hashlib
 import logging
 import math
 import re
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ from .text import chunk_text
 
 
 logger = logging.getLogger(__name__)
+TRANSIENT_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 
 
 def _endpoint(base_url: str, resource: str) -> str:
@@ -29,6 +31,33 @@ def _endpoint(base_url: str, resource: str) -> str:
     if base.endswith("/v1"):
         return f"{base}/{resource}"
     return f"{base}/v1/{resource}"
+
+
+def _post_with_retry(config: Settings, url: str, **kwargs: Any) -> httpx.Response:
+    attempts = max(1, config.network_retries + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            response = httpx.post(url, **kwargs)
+            if response.status_code not in TRANSIENT_STATUS_CODES or attempt == attempts:
+                response.raise_for_status()
+                return response
+            logger.warning(
+                "远程检索服务返回临时错误 status=%d attempt=%d/%d",
+                response.status_code,
+                attempt,
+                attempts,
+            )
+        except (httpx.TransportError, OSError) as exc:
+            if attempt == attempts:
+                raise
+            logger.warning(
+                "远程检索服务连接失败 error=%s attempt=%d/%d",
+                type(exc).__name__,
+                attempt,
+                attempts,
+            )
+        time.sleep(config.retry_backoff_seconds * attempt)
+    raise RuntimeError("远程检索服务重试结束但未返回结果")
 
 
 def _tokens(text: str) -> list[str]:
@@ -97,13 +126,13 @@ class EmbeddingClient:
             return []
         if not self.remote_enabled:
             return [self._hash_embedding(text) for text in texts]
-        response = httpx.post(
+        response = _post_with_retry(
+            self.config,
             _endpoint(self.config.embedding_base_url, "embeddings"),
             headers={"Authorization": f"Bearer {self.config.embedding_api_key}"},
             json={"model": self.config.embedding_model, "input": texts, "encoding_format": "float"},
             timeout=self.config.llm_timeout,
         )
-        response.raise_for_status()
         rows = sorted(response.json()["data"], key=lambda item: item["index"])
         return [row["embedding"] for row in rows]
 
@@ -131,7 +160,8 @@ class RerankClient:
             return []
         if not self.enabled:
             return [(index, 0.0) for index in range(len(documents))]
-        response = httpx.post(
+        response = _post_with_retry(
+            self.config,
             _endpoint(self.config.rerank_base_url, "rerank"),
             headers={"Authorization": f"Bearer {self.config.rerank_api_key}"},
             json={
@@ -143,7 +173,6 @@ class RerankClient:
             },
             timeout=self.config.llm_timeout,
         )
-        response.raise_for_status()
         return [
             (int(item["index"]), float(item["relevance_score"]))
             for item in response.json().get("results", [])

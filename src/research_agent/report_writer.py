@@ -4,9 +4,10 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from .config import Settings
+from .exceptions import ResearchCancelled
 from .llm import LLMClient
 from .models import ReportChapter, ResearchPlan, SourceDocument
 from .text import chunk_text, query_terms
@@ -21,9 +22,19 @@ logger = logging.getLogger(__name__)
 
 
 class ProfessionalReportWriter:
-    def __init__(self, config: Settings, llm: LLMClient):
+    def __init__(
+        self,
+        config: Settings,
+        llm: LLMClient,
+        is_cancelled: Callable[[], bool] | None = None,
+    ):
         self.config = config
         self.llm = llm
+        self.is_cancelled = is_cancelled or (lambda: False)
+
+    def _check_cancelled(self) -> None:
+        if self.is_cancelled():
+            raise ResearchCancelled("研报生成已取消")
 
     def write(
         self,
@@ -33,10 +44,12 @@ class ProfessionalReportWriter:
         citations: list[dict[str, Any]],
         evidence_packets: list[str] | None = None,
     ) -> tuple[str, list[str]]:
+        self._check_cancelled()
         packets = evidence_packets or [
             self._build_evidence_packet(chapter, sources) for chapter in plan.chapters
         ]
         chapters, warnings = self._write_chapters(plan, packets)
+        self._check_cancelled()
         report = self._assemble(topic, plan, chapters, citations)
         warnings.extend(self.validate(report, plan, citations))
         return report.replace("\ufeff", "").replace("\ufffd", ""), list(dict.fromkeys(warnings))
@@ -45,16 +58,18 @@ class ProfessionalReportWriter:
         self, plan: ResearchPlan, packets: list[str]
     ) -> tuple[list[str], list[str]]:
         if not self.llm.available:
-            chapters = [
-                self._fallback_chapter(chapter, packets[index - 1])
-                for index, chapter in enumerate(plan.chapters, 1)
-            ]
+            chapters = []
+            for index, chapter in enumerate(plan.chapters, 1):
+                self._check_cancelled()
+                chapters.append(self._fallback_chapter(chapter, packets[index - 1]))
             return chapters, ["LLM 未配置，全部章节使用证据摘要模式"]
 
         results: dict[int, str] = {}
         warnings: list[str] = []
         workers = max(1, min(self.config.report_writer_workers, len(plan.chapters)))
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        cancelled = False
+        try:
             futures = {
                 executor.submit(
                     self._write_one_chapter,
@@ -67,15 +82,25 @@ class ProfessionalReportWriter:
                 for index, chapter in enumerate(plan.chapters, 1)
             }
             for future in as_completed(futures):
+                if self.is_cancelled():
+                    cancelled = True
+                    for pending in futures:
+                        pending.cancel()
+                    raise ResearchCancelled("研报生成已取消")
                 index, chapter = futures[future]
                 try:
                     content, rewritten = future.result()
                     results[index] = self._normalize_chapter(chapter, content)
                     if rewritten:
                         warnings.append(f"第 {index} 章首次无引用，已重写一次")
+                except ResearchCancelled:
+                    cancelled = True
+                    raise
                 except Exception as exc:
                     results[index] = self._fallback_chapter(chapter, packets[index - 1])
                     warnings.append(f"第 {index} 章模型失败，已降级：{type(exc).__name__}")
+        finally:
+            executor.shutdown(wait=not cancelled, cancel_futures=True)
         return [results[index] for index in range(1, len(plan.chapters) + 1)], warnings
 
     def _write_one_chapter(
@@ -86,11 +111,14 @@ class ProfessionalReportWriter:
         evidence: str,
         plan: ResearchPlan,
     ) -> tuple[str, bool]:
+        self._check_cancelled()
         content = self._request_chapter(index, total, chapter, evidence, plan, strict=False)
+        self._check_cancelled()
         if re.search(r"\[S\d+\]", content):
             return content, False
         logger.warning("章节无引用，执行一次严格重写 chapter=%d title=%r", index, chapter.title)
         content = self._request_chapter(index, total, chapter, evidence, plan, strict=True)
+        self._check_cancelled()
         return content, True
 
     def _request_chapter(

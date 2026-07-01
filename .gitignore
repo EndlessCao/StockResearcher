@@ -9,3 +9,5 @@ tmp
 macos/.build/
 macos/.swiftpm/
 dist/
+build/
+.DS_Store

@@ -37,14 +37,14 @@ class LLMClient:
         started_at = time.perf_counter()
         logger.info(
             "LLM API 调用开始 model=%s input_chars=%d max_tokens=%d temperature=%.2f",
-            self.config.model_name,
+            self.config.openai_model,
             len(system) + len(user),
             max_tokens,
             temperature,
         )
         try:
             response = self.client.chat.completions.create(
-                model=self.config.model_name,
+                model=self.config.openai_model,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
@@ -55,7 +55,7 @@ class LLMClient:
         except Exception:
             logger.exception(
                 "LLM API 调用失败 model=%s elapsed=%.2fs",
-                self.config.model_name,
+                self.config.openai_model,
                 time.perf_counter() - started_at,
             )
             raise
@@ -63,7 +63,7 @@ class LLMClient:
         usage = getattr(response, "usage", None)
         logger.info(
             "LLM API 调用完成 model=%s elapsed=%.2fs output_chars=%d prompt_tokens=%s completion_tokens=%s",
-            self.config.model_name,
+            self.config.openai_model,
             time.perf_counter() - started_at,
             len(content),
             getattr(usage, "prompt_tokens", None),

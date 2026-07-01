@@ -19,7 +19,7 @@ struct SettingsView: View {
             Form {
                 Section("研究服务") {
                     TextField("API 地址", text: $apiBaseURL)
-                    TextField("项目目录", text: $backendDirectory)
+                    TextField("应用数据目录", text: $backendDirectory)
                     Toggle("启动应用时自动启动本地服务", isOn: $autoStartBackend)
                 }
 
@@ -42,7 +42,7 @@ struct SettingsView: View {
                         .buttonStyle(.borderedProminent)
                     }
                 } footer: {
-                    Text("模型、搜索和向量服务密钥继续从项目目录下的 .env 读取。")
+                    Text("默认目录为 ~/.stock_researcher；.env、数据库、向量索引和研报均保存在该目录下。")
                 }
             }
             .formStyle(.grouped)

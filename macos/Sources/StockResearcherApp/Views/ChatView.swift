@@ -13,16 +13,27 @@ struct ChatView: View {
         store.answeringReportIDs.contains(report.id)
     }
 
+    private var isLoadingHistory: Bool {
+        store.loadingChatHistoryReportIDs.contains(report.id)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 14) {
-                        if messages.isEmpty {
+                        if messages.isEmpty && isLoadingHistory {
+                            ProgressView("正在加载对话记录…")
+                                .padding(.top, 100)
+                        } else if messages.isEmpty {
                             ContentUnavailableView {
                                 Label("基于研报提问", systemImage: "bubble.left.and.text.bubble.right")
                             } description: {
                                 Text("回答会结合研报正文、原始资料和可用的网络检索。")
+                            } actions: {
+                                Button("重新加载历史记录") {
+                                    Task { await store.loadChatHistory(reportID: report.id, force: true) }
+                                }
                             }
                             .padding(.top, 100)
                         }
@@ -68,10 +79,16 @@ struct ChatView: View {
                         .font(.title2)
                 }
                 .buttonStyle(.plain)
-                .disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isAnswering)
+                .disabled(
+                    question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || isAnswering || isLoadingHistory
+                )
                 .keyboardShortcut(.return, modifiers: .command)
             }
             .padding(14)
+        }
+        .task(id: report.id) {
+            await store.loadChatHistory(reportID: report.id)
         }
     }
 

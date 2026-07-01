@@ -107,7 +107,7 @@ class ReportChatAgent:
         try:
             for round_index in range(self.config.chat_tool_rounds):
                 response = self.llm.client.chat.completions.create(
-                    model=self.config.model_name,
+                    model=self.config.openai_model,
                     messages=messages,
                     tools=TOOLS,
                     tool_choice="auto",
@@ -147,7 +147,7 @@ class ReportChatAgent:
                 )
 
             final = self.llm.client.chat.completions.create(
-                model=self.config.model_name,
+                model=self.config.openai_model,
                 messages=messages
                 + [{"role": "system", "content": "停止调用工具，基于已有工具结果直接给出最终回答并标注引用。"}],
                 temperature=0.1,

@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import logging
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from ipaddress import ip_address
 from pathlib import Path
+from threading import Lock
 
 from fastapi import FastAPI, HTTPException, Request, Response, status
 
 from . import __version__
 from .config import settings
 from .env_config import EnvironmentConfigService
+from .exceptions import ResearchCancelled
 from .models import (
     ChatRequest,
     ChatResponse,
+    ConversationMessage,
     EnvironmentConfigRecord,
     EnvironmentConfigUpdate,
     ReportRecord,
@@ -30,7 +36,26 @@ app = FastAPI(
     version=__version__,
 )
 agent = ResearchOrchestrator()
+agent.storage.fail_incomplete_tasks()
 environment_config = EnvironmentConfigService(Path(".env"))
+generation_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="report-generation")
+generation_futures: dict[str, Future[object]] = {}
+generation_lock = Lock()
+logger = logging.getLogger(__name__)
+
+
+def _run_generation(task_id: str, report_request: ReportRequest) -> None:
+    try:
+        agent.create_report(report_request, task_id=task_id)
+    except ResearchCancelled:
+        pass
+    except Exception:
+        logger.exception("后台研报任务失败 task_id=%s", task_id)
+
+
+def _forget_generation(task_id: str) -> None:
+    with generation_lock:
+        generation_futures.pop(task_id, None)
 
 
 def _require_local_request(request: Request) -> None:
@@ -64,6 +89,17 @@ def create_report(request: ReportRequest) -> ReportRecord:
         return agent.create_report(request)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/tasks", response_model=TaskRecord, status_code=status.HTTP_202_ACCEPTED)
+def submit_report_task(request: ReportRequest) -> TaskRecord:
+    task_id = f"task_{uuid.uuid4().hex[:12]}"
+    task = agent.storage.create_task(task_id, request.topic)
+    future = generation_executor.submit(_run_generation, task_id, request)
+    with generation_lock:
+        generation_futures[task_id] = future
+    future.add_done_callback(lambda _future: _forget_generation(task_id))
+    return task
 
 
 @app.get("/api/v1/reports", response_model=list[ReportRecord])
@@ -111,11 +147,41 @@ def chat(report_id: str, request: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.get(
+    "/api/v1/reports/{report_id}/messages",
+    response_model=list[ConversationMessage],
+)
+def get_conversation_messages(report_id: str, limit: int = 200) -> list[ConversationMessage]:
+    if not agent.storage.get_report(report_id):
+        raise HTTPException(status_code=404, detail="研报不存在")
+    rows = agent.storage.conversation_messages(report_id, max(1, min(limit, 500)))
+    return [ConversationMessage.model_validate(row) for row in rows]
+
+
 @app.get("/api/v1/tasks/{task_id}", response_model=TaskRecord)
 def get_task(task_id: str) -> TaskRecord:
     task = agent.storage.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
+    return task
+
+
+@app.get("/api/v1/tasks", response_model=list[TaskRecord])
+def list_tasks(limit: int = 50, active_only: bool = False) -> list[TaskRecord]:
+    return agent.storage.list_tasks(
+        max(1, min(limit, 100)), active_only=active_only
+    )
+
+
+@app.post("/api/v1/tasks/{task_id}/cancel", response_model=TaskRecord)
+def cancel_task(task_id: str) -> TaskRecord:
+    task = agent.storage.cancel_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="生成任务不存在")
+    with generation_lock:
+        future = generation_futures.get(task_id)
+        if future:
+            future.cancel()
     return task
 
 

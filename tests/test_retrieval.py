@@ -1,9 +1,11 @@
 from collections import Counter
 from pathlib import Path
 
+import httpx
+
 from research_agent.config import Settings
 from research_agent.models import ReportChapter, SourceDocument
-from research_agent.retrieval import ChromaHybridRetriever
+from research_agent.retrieval import ChromaHybridRetriever, EmbeddingClient
 
 
 def _source(
@@ -103,3 +105,30 @@ def test_metadata_where_contains_stock_date_and_source_filters() -> None:
     assert {"stock_code": {"$eq": "600519"}} in where["$and"]
     assert {"published_ts": {"$lte": 123456.0}} in where["$and"]
     assert {"source_type": {"$in": ["annual_report", "research"]}} in where["$and"]
+
+
+def test_embedding_transport_error_is_retried(monkeypatch) -> None:
+    config = Settings(
+        _env_file=None,
+        embedding_api_key="test",
+        embedding_base_url="https://embedding.example.com",
+        embedding_model="test-model",
+        network_retries=2,
+        retry_backoff_seconds=0,
+    )
+    calls = 0
+
+    def fake_post(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("SSL EOF", request=httpx.Request("POST", "https://embedding.example.com"))
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://embedding.example.com"),
+            json={"data": [{"index": 0, "embedding": [0.1, 0.2]}]},
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    assert EmbeddingClient(config).embed(["test"]) == [[0.1, 0.2]]
+    assert calls == 2

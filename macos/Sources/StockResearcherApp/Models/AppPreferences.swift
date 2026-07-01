@@ -18,21 +18,48 @@ enum AppDefaults {
     static let defaultMode = "standard"
 
     static var backendDirectory: String {
-        let current = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        if FileManager.default.fileExists(atPath: current.appendingPathComponent("pyproject.toml").path) {
-            return current.path
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".stock_researcher", isDirectory: true)
+            .path
+    }
+
+    static var projectDirectory: String {
+        var candidates: [URL] = []
+        if let configured = ProcessInfo.processInfo.environment["STOCK_RESEARCHER_PROJECT_DIR"] {
+            candidates.append(URL(fileURLWithPath: configured, isDirectory: true))
+        }
+        let current = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        candidates.append(current)
+        candidates.append(current.deletingLastPathComponent())
+
+        var bundleAncestor = Bundle.main.bundleURL
+        for _ in 0..<6 {
+            bundleAncestor.deleteLastPathComponent()
+            candidates.append(bundleAncestor)
         }
 
-        let bundledProject = Bundle.main.bundleURL
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        if FileManager.default.fileExists(atPath: bundledProject.appendingPathComponent("pyproject.toml").path) {
-            return bundledProject.path
-        }
-        return NSHomeDirectory()
+        // SwiftPM development builds retain the source location. This keeps
+        // the Python project separate from the user's writable app directory.
+        var sourceAncestor = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { sourceAncestor.deleteLastPathComponent() }
+        candidates.append(sourceAncestor)
+
+        return candidates.first {
+            FileManager.default.fileExists(
+                atPath: $0.appendingPathComponent("pyproject.toml").path
+            )
+        }?.path ?? current.path
     }
 
     static func register() {
+        let defaults = UserDefaults.standard
+        if let legacyDirectory = defaults.string(forKey: PreferenceKeys.backendDirectory),
+           FileManager.default.fileExists(
+               atPath: URL(fileURLWithPath: legacyDirectory)
+                   .appendingPathComponent("pyproject.toml").path
+           ) {
+            defaults.set(backendDirectory, forKey: PreferenceKeys.backendDirectory)
+        }
         UserDefaults.standard.register(defaults: [
             PreferenceKeys.apiBaseURL: apiBaseURL,
             PreferenceKeys.backendDirectory: backendDirectory,

@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import Settings, settings
+from .exceptions import ResearchCancelled
 from .chat_agent import ReportChatAgent
 from .connectors import DocumentConnector, SearchConnector
 from .llm import LLMClient
@@ -156,8 +157,10 @@ class ResearchOrchestrator:
             chapters=chapters,
         )
 
-    def create_report(self, request: ReportRequest) -> ReportRecord:
-        task_id = f"task_{uuid.uuid4().hex[:12]}"
+    def create_report(
+        self, request: ReportRequest, task_id: str | None = None
+    ) -> ReportRecord:
+        task_id = task_id or f"task_{uuid.uuid4().hex[:12]}"
         logger.info(
             "研报任务开始 task_id=%s topic=%r mode=%s web_search=%s local_sources=%d max_search_results=%d",
             task_id,
@@ -167,20 +170,27 @@ class ResearchOrchestrator:
             len(request.sources),
             request.max_search_results,
         )
-        self.storage.create_task(task_id, request.topic)
-        self.storage.update_task(task_id, status="running")
+        if not self.storage.get_task(task_id):
+            self.storage.create_task(task_id, request.topic)
+        self._check_cancelled(task_id)
+        self.storage.update_task(task_id, status="running", error=None, completed_at=None)
+        report: ReportRecord | None = None
         try:
             plan = self.plan(request.topic, request.mode)
+            self._check_cancelled(task_id)
             logger.info("资料收集开始 task_id=%s", task_id)
             sources = self._collect_sources(request, plan)
+            self._check_cancelled(task_id)
             if not sources:
                 raise RuntimeError("没有可用资料：请配置搜索 API，或通过 --sources 提供本地文件/URL")
             logger.info("资料收集完成 task_id=%s sources=%d", task_id, len(sources))
             for source in sources:
+                self._check_cancelled(task_id)
                 self.storage.add_source(task_id, source)
             logger.info("资料切分与入库完成 task_id=%s sources=%d", task_id, len(sources))
             logger.info("研报写作开始 task_id=%s chapters=%d", task_id, len(plan.chapters))
             report = self._write_report(task_id, request.topic, plan, sources, request)
+            self._check_cancelled(task_id)
             logger.info(
                 "研报写作完成 task_id=%s report_id=%s content_chars=%d",
                 task_id,
@@ -200,12 +210,36 @@ class ResearchOrchestrator:
                 len(report.citations),
             )
             return report
+        except ResearchCancelled:
+            if report:
+                report_path = Path(report.path).expanduser().resolve()
+                reports_dir = self.config.reports_dir.expanduser().resolve()
+                if report_path.is_relative_to(reports_dir) and report_path.is_file():
+                    report_path.unlink()
+            self.storage.cleanup_task_artifacts(task_id)
+            self.storage.update_task(
+                task_id,
+                status="cancelled",
+                error="用户取消生成",
+                completed_at=utc_now(),
+            )
+            logger.info("研报任务已取消 task_id=%s", task_id)
+            raise
         except Exception as exc:
+            current_task = self.storage.get_task(task_id)
+            if current_task and current_task.status == "cancelled":
+                self.storage.cleanup_task_artifacts(task_id)
+                raise ResearchCancelled("研报生成已取消") from exc
             self.storage.update_task(
                 task_id, status="failed", error=str(exc), completed_at=utc_now()
             )
             logger.exception("研报任务失败 task_id=%s error=%s", task_id, type(exc).__name__)
             raise
+
+    def _check_cancelled(self, task_id: str) -> None:
+        task = self.storage.get_task(task_id)
+        if task and task.status == "cancelled":
+            raise ResearchCancelled("研报生成已取消")
 
     def _collect_sources(self, request: ReportRequest, plan: ResearchPlan) -> list[SourceDocument]:
         sources: list[SourceDocument] = []
@@ -272,7 +306,6 @@ class ResearchOrchestrator:
             datetime.fromisoformat(data_cutoff)
         except ValueError as exc:
             raise ValueError("data_cutoff 必须使用 YYYY-MM-DD 格式") from exc
-        self.retriever.index_documents(task_id, sources, request.stock_code, citation_ids)
         plan = plan.model_copy(
             update={
                 "stock_code": request.stock_code,
@@ -280,27 +313,47 @@ class ResearchOrchestrator:
                 "source_types": request.source_types,
             }
         )
-        evidence_packets = []
+        evidence_packets: list[str] | None = []
         retrieval_diagnostics = []
-        for chapter in plan.chapters:
-            packet, diagnostics = self.retriever.retrieve_chapter(
-                task_id,
-                chapter,
-                request.stock_code,
-                data_cutoff,
-                request.source_types,
+        retrieval_warning: str | None = None
+        try:
+            self.retriever.index_documents(task_id, sources, request.stock_code, citation_ids)
+            for chapter in plan.chapters:
+                packet, diagnostics = self.retriever.retrieve_chapter(
+                    task_id,
+                    chapter,
+                    request.stock_code,
+                    data_cutoff,
+                    request.source_types,
+                )
+                evidence_packets.append(packet)
+                retrieval_diagnostics.append(diagnostics)
+                logger.info(
+                    "章节混合检索完成 title=%r questions=%d evidence_blocks=%d",
+                    chapter.title,
+                    len(chapter.retrieval_questions),
+                    len(diagnostics),
+                )
+        except Exception as exc:
+            evidence_packets = None
+            retrieval_warning = f"远程向量检索失败，已回退本地章节证据池：{type(exc).__name__}"
+            logger.warning(
+                "章节混合检索失败，回退本地证据池 error=%s",
+                type(exc).__name__,
+                exc_info=True,
             )
-            evidence_packets.append(packet)
-            retrieval_diagnostics.append(diagnostics)
-            logger.info(
-                "章节混合检索完成 title=%r questions=%d evidence_blocks=%d",
-                chapter.title,
-                len(chapter.retrieval_questions),
-                len(diagnostics),
-            )
-        content, qa_warnings = ProfessionalReportWriter(self.config, self.llm).write(
+        content, qa_warnings = ProfessionalReportWriter(
+            self.config,
+            self.llm,
+            is_cancelled=lambda: (
+                (task := self.storage.get_task(task_id)) is not None
+                and task.status == "cancelled"
+            ),
+        ).write(
             topic, plan, sources, citations, evidence_packets=evidence_packets
         )
+        if retrieval_warning:
+            qa_warnings.insert(0, retrieval_warning)
         report_title = plan.title or f"{topic}研究报告"
         path = self.config.reports_dir / report_filename(report_title)
         path.write_text(content, encoding="utf-8")

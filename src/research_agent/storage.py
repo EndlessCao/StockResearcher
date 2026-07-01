@@ -95,6 +95,44 @@ class Storage:
             row = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         return TaskRecord(**dict(row)) if row else None
 
+    def list_tasks(self, limit: int = 50, active_only: bool = False) -> list[TaskRecord]:
+        query = "SELECT * FROM tasks"
+        parameters: list[Any] = []
+        if active_only:
+            query += " WHERE status IN ('pending', 'running')"
+        query += " ORDER BY created_at DESC LIMIT ?"
+        parameters.append(limit)
+        with self.connect() as db:
+            rows = db.execute(query, parameters).fetchall()
+        return [TaskRecord(**dict(row)) for row in rows]
+
+    def cancel_task(self, task_id: str) -> TaskRecord | None:
+        task = self.get_task(task_id)
+        if not task:
+            return None
+        if task.status in {"completed", "failed", "cancelled"}:
+            return task
+        self.update_task(
+            task_id,
+            status="cancelled",
+            error="用户取消生成",
+            completed_at=utc_now(),
+        )
+        return self.get_task(task_id)
+
+    def fail_incomplete_tasks(self) -> None:
+        with self.connect() as db:
+            db.execute(
+                """UPDATE tasks SET status = 'failed', error = ?, completed_at = ?
+                WHERE status IN ('pending', 'running')""",
+                ("服务已重启，原生成任务已终止", utc_now()),
+            )
+
+    def cleanup_task_artifacts(self, task_id: str) -> None:
+        with self.connect() as db:
+            db.execute("DELETE FROM chunks WHERE task_id = ?", (task_id,))
+            db.execute("DELETE FROM sources WHERE task_id = ?", (task_id,))
+
     def add_source(self, task_id: str, source: SourceDocument) -> None:
         with self.connect() as db:
             db.execute(
@@ -241,14 +279,20 @@ class Storage:
             )
 
     def recent_messages(self, report_id: str, limit: int = 6) -> list[dict[str, Any]]:
+        return self.conversation_messages(report_id, limit)
+
+    def conversation_messages(self, report_id: str, limit: int = 200) -> list[dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute(
-                """SELECT role, content, citations FROM conversations WHERE report_id = ?
-                ORDER BY id DESC LIMIT ?""",
+                """SELECT id, role, content, citations, created_at FROM (
+                    SELECT id, role, content, citations, created_at
+                    FROM conversations WHERE report_id = ?
+                    ORDER BY id DESC LIMIT ?
+                ) ORDER BY id ASC""",
                 (report_id, limit),
             ).fetchall()
         messages = []
-        for row in reversed(rows):
+        for row in rows:
             item = dict(row)
             item["citations"] = json.loads(item.get("citations") or "[]")
             messages.append(item)

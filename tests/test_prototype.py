@@ -1,10 +1,12 @@
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from research_agent.api import app
 from research_agent.config import Settings
 from research_agent.env_config import EnvironmentConfigService
+from research_agent.exceptions import ResearchCancelled
 from research_agent.models import ReportRequest
 from research_agent.orchestrator import ResearchOrchestrator
 from research_agent.report_writer import ProfessionalReportWriter
@@ -38,6 +40,10 @@ def test_local_report_and_chat_without_external_services(tmp_path: Path) -> None
     response = agent.chat(report.id, "主要风险是什么？")
     assert "客户集中度" in response.answer
     assert response.citations
+    history = agent.storage.conversation_messages(report.id)
+    assert [message["role"] for message in history] == ["user", "assistant"]
+    assert history[0]["content"] == "主要风险是什么？"
+    assert history[1]["citations"]
 
 
 def test_health_endpoint() -> None:
@@ -90,14 +96,25 @@ def test_environment_config_preserves_unmanaged_content(tmp_path: Path) -> None:
     assert 'OPENAI_API_KEY="secret\\"value"' in content
 
 
-def test_litellm_model_prefix_is_normalized() -> None:
-    config = Settings(
-        _env_file=None,
-        openai_api_key="test",
-        openai_model="ignored",
-        litellm_model="openai/deepseek-v4-pro",
+def test_cancelled_generation_does_not_create_report(tmp_path: Path) -> None:
+    source = tmp_path / "evidence.md"
+    source.write_text("不应生成研报", encoding="utf-8")
+    agent = ResearchOrchestrator(
+        Settings(_env_file=None, openai_api_key="", data_dir=tmp_path / "data")
     )
-    assert config.model_name == "deepseek-v4-pro"
+    task = agent.storage.create_task("task_cancelled", "取消测试")
+    cancelled = agent.storage.cancel_task(task.id)
+
+    with pytest.raises(ResearchCancelled):
+        agent.create_report(
+            ReportRequest(topic="取消测试", sources=[str(source)], web_search=False),
+            task_id=task.id,
+        )
+
+    assert cancelled is not None
+    assert cancelled.status == "cancelled"
+    assert agent.storage.list_tasks(active_only=True) == []
+    assert agent.storage.list_reports() == []
 
 
 def test_report_degrades_when_llm_fails(tmp_path: Path) -> None:
@@ -226,3 +243,23 @@ def test_info_logs_require_info_debug() -> None:
     assert Settings(_env_file=None, info="").info_logging_enabled is False
     assert Settings(_env_file=None, info="INFO").info_logging_enabled is False
     assert Settings(_env_file=None, info="debug").info_logging_enabled is True
+
+
+def test_vector_tls_failure_falls_back_without_failing_report(tmp_path: Path) -> None:
+    source = tmp_path / "evidence.md"
+    source.write_text("可追溯事实和反方观点。", encoding="utf-8")
+    agent = ResearchOrchestrator(
+        Settings(_env_file=None, openai_api_key="", data_dir=tmp_path / "data")
+    )
+
+    def fail_index(*_args, **_kwargs):
+        raise OSError("[SSL: UNEXPECTED_EOF_WHILE_READING]")
+
+    agent.retriever.index_documents = fail_index
+    report = agent.create_report(
+        ReportRequest(topic="TLS 降级测试", sources=[str(source)], web_search=False, mode="quick")
+    )
+
+    assert Path(report.path).exists()
+    assert any("已回退本地章节证据池" in warning for warning in report.qa_warnings)
+    assert agent.storage.get_task(report.task_id).status == "completed"

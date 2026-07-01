@@ -14,7 +14,6 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_base_url: str | None = None
     openai_model: str = "gpt-4.1-mini"
-    litellm_model: str | None = None
 
     tavily_api_keys: str = ""
     brave_api_keys: str = ""
@@ -38,6 +37,8 @@ class Settings(BaseSettings):
     data_dir: Path = Field(default=Path("data"))
     request_timeout: float = 25.0
     llm_timeout: float = 180.0
+    network_retries: int = 2
+    retry_backoff_seconds: float = 0.5
     max_document_chars: int = 30_000
     chunk_size: int = 1_200
     chunk_overlap: int = 160
@@ -55,16 +56,6 @@ class Settings(BaseSettings):
     @property
     def info_logging_enabled(self) -> bool:
         return self.info.strip().upper() == "DEBUG"
-
-    @property
-    def model_name(self) -> str:
-        name = self.litellm_model or self.openai_model
-        # LITELLM_MODEL is often written as "provider/model". This prototype
-        # talks directly to the configured OpenAI-compatible endpoint, whose
-        # model parameter normally expects the suffix only.
-        if "/" in name and name.split("/", 1)[0] in {"openai", "deepseek"}:
-            return name.split("/", 1)[1]
-        return name
 
     @property
     def database_path(self) -> Path:

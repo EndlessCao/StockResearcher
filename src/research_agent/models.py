@@ -64,7 +64,7 @@ class ChatRequest(BaseModel):
 class TaskRecord(BaseModel):
     id: str
     topic: str
-    status: Literal["pending", "running", "completed", "failed"]
+    status: Literal["pending", "running", "completed", "failed", "cancelled"]
     error: str | None = None
     report_id: str | None = None
     created_at: str
@@ -103,3 +103,11 @@ class EnvironmentConfigUpdate(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     citations: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ConversationMessage(BaseModel):
+    id: int
+    role: Literal["user", "assistant"]
+    content: str
+    citations: list[dict[str, Any]] = Field(default_factory=list)
+    created_at: str

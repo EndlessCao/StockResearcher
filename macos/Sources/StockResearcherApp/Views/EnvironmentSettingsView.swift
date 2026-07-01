@@ -11,7 +11,6 @@ struct EnvironmentSettingsView: View {
                     SecureField("OpenAI API Key", text: binding("OPENAI_API_KEY"))
                     TextField("OpenAI Base URL", text: binding("OPENAI_BASE_URL"))
                     TextField("OpenAI Model", text: binding("OPENAI_MODEL"))
-                    TextField("LiteLLM Model", text: binding("LITELLM_MODEL"))
                 }
 
                 Section("网络检索") {
